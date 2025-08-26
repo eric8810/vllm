@@ -61,6 +61,20 @@ from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     maybe_prefix)
 
 
+class DeepSeekV31Config(DeepseekV3Config):
+    """
+    DeepSeek-V3.1 specific configuration.
+    
+    Inherits from DeepSeekV3Config but with V3.1-specific requirements:
+    - e_score_correction_bias parameters must use FP32 precision
+    - Compatible with UE8M0 FP8 scale format
+    """
+    model_type = "deepseek_v31"
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+
 class DeepseekV2MLP(nn.Module):
 
     def __init__(
@@ -125,8 +139,10 @@ class DeepseekV2MoE(nn.Module):
                                      quant_config=None,
                                      prefix=f"{prefix}.gate")
         if config.topk_method == "noaux_tc":
+            # DeepSeek-V3.1 requires FP32 precision for e_score_correction_bias
+            dtype = torch.float32 if isinstance(config, DeepSeekV31Config) else None
             self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts))
+                torch.empty(config.n_routed_experts, dtype=dtype))
         else:
             self.gate.e_score_correction_bias = None
 
@@ -971,6 +987,17 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
+
+
+class DeepseekV31ForCausalLM(DeepseekV3ForCausalLM):
+    """
+    DeepSeek-V3.1 model implementation.
+    
+    Inherits from DeepSeekV3ForCausalLM with V3.1-specific configurations:
+    - Uses DeepSeekV31Config for proper FP32 e_score_correction_bias handling
+    - Supports UE8M0 FP8 scale format requirements
+    """
+    config_class = DeepSeekV31Config
 
 
 # Compatibility with
