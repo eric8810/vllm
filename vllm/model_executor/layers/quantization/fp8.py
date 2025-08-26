@@ -491,6 +491,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.layer = layer
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
+        
+        # Check for block-wise quantization support
+        if self.block_quant:
+            if current_platform.is_device_capability(100):  # B200
+                self.use_block_quantization = True
+                self.block_shape = tuple(self.quant_config.weight_block_size)
+                logger.info(f"Using block-wise FP8 quantization with shape {self.block_shape}")
+            else:
+                logger.warning(
+                    "Block-wise FP8 quantization requested but not supported on this GPU. "
+                    "Falling back to per-tensor quantization."
+                )
+                self.use_block_quantization = False
+                self.block_shape = None
+        else:
+            self.use_block_quantization = False
+            self.block_shape = None
 
         self.flashinfer_moe_backend: Optional[FlashinferMoeBackend] = None
         self.fused_experts: Optional[

@@ -14,6 +14,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape)
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
@@ -56,6 +59,51 @@ def cutlass_block_fp8_supported() -> bool:
     capability = -1 if capability_tuple is None else capability_tuple.to_int()
 
     return ops.cutlass_scaled_mm_supports_block_fp8(capability)
+
+
+def is_valid_flashinfer_cutlass_fused_moe_blockwise(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    block_shape: Optional[tuple[int, int]] = None
+) -> bool:
+    """
+    Check if block-wise FlashInfer CUTLASS MoE is supported
+    """
+    from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
+    
+    if not has_flashinfer_cutlass_fused_moe():
+        return False
+    
+    # Check for B200 support
+    if block_shape is not None:
+        if not cutlass_block_fp8_supported():
+            logger.debug_once(
+                "Block-wise FP8 not supported on this GPU. "
+                "B200 (SM100) with CUDA 12.8+ required."
+            )
+            return False
+        
+        # Validate block sizes
+        block_m, block_n = block_shape
+        if block_m != 128 or block_n != 128:
+            logger.debug_once(
+                f"Unsupported block shape {block_shape}. "
+                "Only [128, 128] is currently supported."
+            )
+            return False
+        
+        # Check that we're actually on B200 (SM100)
+        capability_tuple = current_platform.get_device_capability()
+        capability = -1 if capability_tuple is None else capability_tuple.to_int()
+        if capability < 100:
+            logger.debug_once(
+                f"Block-wise FP8 quantization requires SM100+ (B200), "
+                f"but found SM{capability}."
+            )
+            return False
+    
+    return True
 
 
 def cutlass_group_gemm_supported() -> bool:

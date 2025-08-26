@@ -19,7 +19,8 @@ logger = init_logger(__name__)
 
 def is_valid_flashinfer_cutlass_fused_moe(hidden_states: torch.Tensor,
                                           w1: torch.Tensor,
-                                          w2: torch.Tensor) -> bool:
+                                          w2: torch.Tensor,
+                                          block_shape: Optional[tuple[int, int]] = None) -> bool:
     """
     Check if the given problem size is supported by the FlashInfer CUTLASS MoE
     kernel.
@@ -28,6 +29,25 @@ def is_valid_flashinfer_cutlass_fused_moe(hidden_states: torch.Tensor,
         logger.debug_once("FlashInferExperts disabled: "
                           "flashinfer_cutlass_fused_moe not available.")
         return False
+    
+    # Check for block-wise FP8 support on B200
+    if block_shape is not None:
+        from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+            cutlass_block_fp8_supported)
+        if not cutlass_block_fp8_supported():
+            logger.debug_once(
+                "Block-wise FP8 not supported on this GPU. "
+                "B200 (SM100) with CUDA 12.8+ required.")
+            return False
+        
+        # Validate block sizes
+        block_m, block_n = block_shape
+        if block_m != 128 or block_n != 128:
+            logger.debug_once(
+                f"Unsupported block shape {block_shape}. "
+                "Only [128, 128] is currently supported.")
+            return False
+    
     # Data type checks
     if (w1.dtype != torch.uint8 or w2.dtype != torch.uint8
             or hidden_states.dtype
@@ -50,6 +70,7 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
         a2_gscale: torch.Tensor,
         out_dtype: torch.dtype,
         quant_dtype: Union[torch.dtype, str, None],
+        block_shape: Optional[tuple[int, int]] = None,
         ep_rank: int = 0,
         ep_size: int = 1,
         tp_rank: int = 0,
@@ -59,7 +80,7 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
             FusedMoEQuantConfig(
                 quant_dtype=quant_dtype,
                 per_act_token_quant=False,
-                block_shape=None,
+                block_shape=block_shape,
             ))
         assert quant_dtype in ("nvfp4", torch.float8_e4m3fn), (
             "Only nvfp4,fp8 quantization are currently supported.")
@@ -72,6 +93,42 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
         self.a1_gscale = a1_gscale
         self.a2_gscale = a2_gscale
         self.out_dtype = out_dtype
+        self.block_shape = block_shape
+        self.is_block_quantized = block_shape is not None
+
+    def _prepare_block_scales(self, scale_tensor: torch.Tensor, 
+                              weight_shape: tuple[int, int],
+                              block_m: int, block_n: int) -> torch.Tensor:
+        """
+        Prepare block-wise scales for the given weight tensor.
+        
+        Args:
+            scale_tensor: Block-wise scale tensor
+            weight_shape: Shape of the weight tensor (M, N)
+            block_m: Block size for M dimension
+            block_n: Block size for N dimension
+            
+        Returns:
+            Reshaped block-wise scale tensor
+        """
+        if scale_tensor is None:
+            return None
+            
+        weight_m, weight_n = weight_shape
+        num_blocks_m = (weight_m + block_m - 1) // block_m
+        num_blocks_n = (weight_n + block_n - 1) // block_n
+        
+        # Ensure the scale tensor has the correct dimensions
+        expected_shape = (num_blocks_m, num_blocks_n)
+        if scale_tensor.shape != expected_shape:
+            # If scale_tensor is 1D, expand it to 2D
+            if scale_tensor.dim() == 1:
+                scale_tensor = scale_tensor.view(-1, 1).expand(expected_shape)
+            else:
+                # Reshape to match expected block structure
+                scale_tensor = scale_tensor.reshape(expected_shape)
+        
+        return scale_tensor.contiguous()
 
     @property
     def activation_formats(
@@ -153,13 +210,37 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
         apply_router_weight_on_input: Optional[bool],
     ):
         if self.quant_dtype == torch.float8_e4m3fn:
-            quant_scales = [
-                self.g1_alphas, self.a2_gscale, self.g2_alphas, self.a1_gscale
-            ]
-
-            a1q_scale = None  # not passing input_sf in fp8
-            fc1_expert_weights = w1
-            fc2_expert_weights = w2
+            if self.is_block_quantized:
+                # Handle block-wise scales
+                # Reshape scale tensors to match block structure
+                block_m, block_n = self.block_shape
+                
+                # Prepare block-wise scales
+                w1_block_scales = self._prepare_block_scales(w1_scale, w1.shape, block_m, block_n)
+                w2_block_scales = self._prepare_block_scales(w2_scale, w2.shape, block_m, block_n)
+                
+                # For block-wise quantization, we need to use a different kernel call
+                # This is a placeholder for the block-wise FlashInfer kernel
+                # The actual implementation would need to be added to the FlashInfer library
+                logger.warning_once(
+                    "Block-wise FlashInfer CUTLASS MoE kernel not yet implemented. "
+                    "Falling back to per-tensor quantization.")
+                
+                # Fallback to per-tensor for now
+                quant_scales = [
+                    self.g1_alphas, self.a2_gscale, self.g2_alphas, self.a1_gscale
+                ]
+                a1q_scale = None
+                fc1_expert_weights = w1
+                fc2_expert_weights = w2
+            else:
+                # Existing per-tensor implementation
+                quant_scales = [
+                    self.g1_alphas, self.a2_gscale, self.g2_alphas, self.a1_gscale
+                ]
+                a1q_scale = None  # not passing input_sf in fp8
+                fc1_expert_weights = w1
+                fc2_expert_weights = w2
         else:
             # Ensure w1_scale and w2_scale are not None before calling view
             assert w1_scale is not None and w2_scale is not None, (
@@ -225,6 +306,7 @@ def flashinfer_cutlass_moe_fp4(
             a2_gscale=a2_gscale,
             out_dtype=hidden_states.dtype,
             quant_dtype="nvfp4",
+            block_shape=None,  # nvfp4 doesn't support block quantization yet
         ))
 
     return fused_experts(

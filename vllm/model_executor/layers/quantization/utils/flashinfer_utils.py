@@ -172,8 +172,14 @@ def build_flashinfer_fp8_cutlass_moe_prepare_finalize(
 ) -> mk.FusedMoEPrepareAndFinalize:
     """Create a FlashInfer CUTLASS fused-MoE prepare finalize kernel"""
     use_dp = moe.moe_parallel_config.dp_size > 1 if moe is not None else False
+    
+    # Check for block-wise quantization
+    block_shape = None
+    if hasattr(layer, 'weight_block_size') and layer.weight_block_size is not None:
+        block_shape = tuple(layer.weight_block_size)
+    
     return FlashInferCutlassMoEPrepareAndFinalize(
-        use_dp, a1_gscale=layer.w13_input_scale)
+        use_dp, a1_gscale=layer.w13_input_scale, block_shape=block_shape)
 
 
 def select_cutlass_fp8_gemm_impl(
@@ -187,6 +193,11 @@ def select_cutlass_fp8_gemm_impl(
     assert layer.custom_routing_function == Llama4MoE.custom_routing_function, \
         "FusedMoE flashinfer kernels are only supported for Llama4"
 
+    # Check for block-wise quantization
+    block_shape = None
+    if hasattr(layer, 'weight_block_size') and layer.weight_block_size is not None:
+        block_shape = tuple(layer.weight_block_size)
+
     if moe is not None:
         return FlashInferExperts(
             g1_alphas=layer.output1_scales_gate_scalar,
@@ -195,6 +206,7 @@ def select_cutlass_fp8_gemm_impl(
             a2_gscale=layer.w2_input_scale_inv,
             out_dtype=moe.in_dtype,
             quant_dtype=torch.float8_e4m3fn,
+            block_shape=block_shape,
             ep_rank=moe.moe_parallel_config.ep_rank,
             ep_size=moe.moe_parallel_config.ep_size,
             tp_rank=moe.moe_parallel_config.tp_rank,
@@ -210,6 +222,7 @@ def select_cutlass_fp8_gemm_impl(
         a2_gscale=layer.w2_input_scale_inv,
         out_dtype=out_dtype,
         quant_dtype=torch.float8_e4m3fn,
+        block_shape=block_shape,
     )
 
 

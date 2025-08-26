@@ -24,12 +24,14 @@ class FlashInferCutlassMoEPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         use_dp: bool,
         a1_gscale: Optional[torch.Tensor],
         num_dispatchers: int = 1,
+        block_shape: Optional[tuple[int, int]] = None,
     ):
         super().__init__()
         self.num_dispatchers_ = num_dispatchers
         self.use_dp = use_dp
         self.a1_gscale = a1_gscale
         self.local_tokens = None
+        self.block_shape = block_shape
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:

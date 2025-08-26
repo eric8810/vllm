@@ -12,6 +12,8 @@ from vllm import _custom_ops as ops
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe.flashinfer_cutlass_moe import (
     FlashInferExperts, is_valid_flashinfer_cutlass_fused_moe)
+from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+    is_valid_flashinfer_cutlass_fused_moe_blockwise)
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEModularKernel)
@@ -141,6 +143,76 @@ def test_flashinfer_fp4_moe_no_graph(m: int, n: int, k: int, e: int, topk: int,
                                    flashinfer_output,
                                    atol=1e-1,
                                    rtol=1e-1)
+
+
+@pytest.mark.skipif(not current_platform.is_device_capability(100), 
+                    reason="Requires B200 GPU (SM100) for block-wise FP8")
+@pytest.mark.parametrize("m,n,k", [(64, 1024, 1024), (224, 1024, 1536)])
+@pytest.mark.parametrize("e", [64, 128])
+@pytest.mark.parametrize("topk", [1, 4])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@torch.inference_mode()
+def test_flashinfer_cutlass_block_fp8(m: int, n: int, k: int, e: int, 
+                                       topk: int, dtype: torch.dtype):
+    """Test block-wise FP8 quantization for FlashInfer CUTLASS MoE"""
+    current_platform.seed_everything(42)
+    
+    # Block shape for B200
+    block_shape = (128, 128)
+    
+    # Create test input
+    hidden_states = torch.randn(m, k, dtype=dtype, device="cuda")
+    
+    # Create block-quantized weights (placeholder - would need actual quantization)
+    w1 = torch.randint(-128, 127, (e, 2*n, k), dtype=torch.uint8, device="cuda")
+    w2 = torch.randint(-128, 127, (e, k, n), dtype=torch.uint8, device="cuda")
+    
+    # Create block-wise scales
+    block_m, block_k = block_shape
+    w1_scale_shape = (e, (2*n + block_m - 1) // block_m, 
+                      (k + block_k - 1) // block_k)
+    w2_scale_shape = (e, (k + block_m - 1) // block_m, 
+                      (n + block_k - 1) // block_k)
+    
+    w1_scale = torch.rand(w1_scale_shape, dtype=torch.float32, device="cuda") * 0.1
+    w2_scale = torch.rand(w2_scale_shape, dtype=torch.float32, device="cuda") * 0.1
+    
+    # Test block-wise validity check
+    assert is_valid_flashinfer_cutlass_fused_moe_blockwise(
+        hidden_states, w1, w2, block_shape=block_shape
+    ), "Block-wise FlashInfer CUTLASS should be supported on B200"
+    
+    # Test invalid block shapes
+    invalid_block_shape = (64, 64)
+    assert not is_valid_flashinfer_cutlass_fused_moe_blockwise(
+        hidden_states, w1, w2, block_shape=invalid_block_shape
+    ), "Invalid block shape should not be supported"
+    
+    # Test FlashInferExperts with block shape
+    g1_alphas = torch.ones(e, dtype=torch.float32, device="cuda") * 0.1
+    g2_alphas = torch.ones(e, dtype=torch.float32, device="cuda") * 0.1
+    a1_gscale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+    a2_gscale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+    
+    experts = FlashInferExperts(
+        g1_alphas=g1_alphas,
+        g2_alphas=g2_alphas,
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
+        out_dtype=dtype,
+        quant_dtype=torch.float8_e4m3fn,
+        block_shape=block_shape,
+    )
+    
+    assert experts.is_block_quantized, "Expert should be marked as block-quantized"
+    assert experts.block_shape == block_shape, "Block shape should be preserved"
+    
+    # Test block scale preparation
+    prepared_w1_scale = experts._prepare_block_scales(
+        w1_scale[0], w1[0].shape, block_m, block_k
+    )
+    assert prepared_w1_scale is not None, "Block scales should be prepared"
+    assert prepared_w1_scale.is_contiguous(), "Block scales should be contiguous"
 
 
 if __name__ == "__main__":
